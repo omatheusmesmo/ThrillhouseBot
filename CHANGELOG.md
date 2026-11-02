@@ -4,6 +4,10 @@ All notable changes to ThrillhouseBot.
 
 ## [Unreleased]
 
+### Changed
+
+- **The webhook entry now rides the Quarkiverse GitHub App extension** (`io.quarkiverse.githubapp:quarkus-github-app`): the extension owns the `POST /api/webhook` route, the `X-Hub-Signature-256` check over the raw body and the delivery parsing, and `webhook/WebhookEvents` receives the raw event and routes it exactly as the former hand-rolled `WebhookController` did (dedupe, pause, trigger filters, commands). The HTTP answers change in the malformed-request corner cases: a delivery missing its mandatory headers is a `400` instead of `401`, a signed non-JSON body is a `500` instead of `400`, and a signature mismatch is also `400`, all from the extension's own route; a valid body answers `200` with an empty body instead of `{"status":"ok"}`, and `WebhookVerifier` is gone. The three App settings (`GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`) keep their names and are aliased into `quarkus.github-app.*`.
+
 ### Added
 
 - A weekly workflow prunes old container images: snapshot builds from `main` beyond the 10 newest of each variant, `test-*` images older than 30 days, and the untagged images that only those used. Releases, `latest`, `snapshot` and their signatures and attestations are kept. A manual run prints the plan and deletes only when asked.

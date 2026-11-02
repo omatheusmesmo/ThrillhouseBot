@@ -33,6 +33,9 @@ import dev.thiagogonzaga.thrillhousebot.review.ReviewDispatcher;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewOrchestrator;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewSkipEmitter;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewSkipReason;
+import io.quarkiverse.githubapp.GitHubEvent;
+import io.quarkiverse.githubapp.runtime.SimpleGitHubEvent;
+import io.vertx.core.json.JsonObject;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -48,15 +51,13 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
-class WebhookControllerTest {
+class WebhookEventsTest {
 
   @Mock private ThrillhouseConfig config;
 
   @Mock private ThrillhouseConfig.GitHubConfig githubConfig;
 
   @Mock private ThrillhouseConfig.ReviewConfig reviewConfig;
-
-  @Mock private WebhookVerifier verifier;
 
   @Mock private TriggerDetector triggerDetector;
 
@@ -91,7 +92,7 @@ class WebhookControllerTest {
   /** A non-null delivery id; the mocked deduplicator reports it unseen unless a test overrides. */
   private static final String DELIVERY = "00000000-0000-0000-0000-000000000001";
 
-  private WebhookController controller;
+  private WebhookEvents events;
 
   @BeforeEach
   void setUp() {
@@ -100,13 +101,12 @@ class WebhookControllerTest {
     when(githubConfig.webhookSecret()).thenReturn("test-secret");
     when(config.review()).thenReturn(reviewConfig);
     when(reviewConfig.conversationalRepliesEnabled()).thenReturn(true);
-    controller = newController(triggerFilter);
+    events = newEvents(triggerFilter);
   }
 
-  private WebhookController newController(ReviewTriggerFilter filter) {
-    return new WebhookController(
+  private WebhookEvents newEvents(ReviewTriggerFilter filter) {
+    return new WebhookEvents(
         config,
-        verifier,
         triggerDetector,
         filter,
         labelGate,
@@ -124,102 +124,134 @@ class WebhookControllerTest {
         mapper);
   }
 
-  @Test
-  void shouldReturn200WithValidSignature() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
+  /**
+   * Builds the GitHubEvent the extension would deliver for a payload body: the same constructor the
+   * extension's Routes uses (installation id and repository full name extracted from the payload
+   * JSON), so the regressions drive the production payload shape with no mocks.
+   */
+  private GitHubEvent event(String eventType, String deliveryId, byte[] body) {
+    return event(eventType, deliveryId, new String(body, StandardCharsets.UTF_8));
+  }
 
+  private GitHubEvent event(String eventType, String deliveryId, String json) {
+    var parsed = new JsonObject(json);
+    var installation = parsed.getJsonObject("installation");
+    var repository = parsed.getJsonObject("repository");
+    return new SimpleGitHubEvent(
+        installation != null ? installation.getLong("id") : null,
+        null,
+        deliveryId,
+        repository != null ? repository.getString("full_name") : null,
+        eventType,
+        parsed.getString("action"),
+        json,
+        parsed,
+        false);
+  }
+
+  @Test
+  void shouldDispatchWhenDrivenThroughThePullRequestObserver() {
     var body =
         buildPullRequestPayload("opened", 42, "owner/repo", "abc123", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.onPullRequest(event("pull_request", DELIVERY, body));
 
-    assertEquals(200, response.getStatus());
+    verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
-  void shouldReturn401WithInvalidSignature() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(false);
+  void shouldRouteThroughEveryObserverWithoutDispatchingAnythingElse() {
+    // Every observer reaches the same routing, so a wiring regression in one of them cannot
+    // produce a delivery that is silently dispatched under the wrong event type.
+    events.onIssueComment(
+        event("issue_comment", "d-ic", buildIssueCommentPayload("created", 1, "a/b", "u", "hi")));
+    verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
 
-    var body = "{}".getBytes(StandardCharsets.UTF_8);
+    events.onReviewComment(
+        event(
+            "pull_request_review_comment",
+            "d-rc",
+            buildReviewCommentPayload("created", 1, "a/b", "u", "plain", null, 4L)));
+    verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
 
-    var response = controller.handleWebhook("sha256=invalid", "pull_request", null, DELIVERY, body);
+    events.onCheckSuiteCompleted(
+        event("check_suite", "d-cs", buildCheckSuitePayload("completed", "a/b", "shaX", 3L)));
+    verify(reviewDispatcher, never()).dispatchCiRecheck(any());
 
-    assertEquals(401, response.getStatus());
-    var entity = (String) response.getEntity();
-    assertTrue(entity.contains("Invalid signature"));
+    events.onStatus(event("status", "d-st", buildStatusPayload("a/b", "shaY", "success")));
+    verify(reviewDispatcher, never()).dispatchCiRecheck(any());
+
+    events.onPing(event("ping", "d-p", "{\"zen\":\"keep it small\"}"));
+    events.onInstallationEvent(
+        event("installation", "d-in", buildInstallationPayload("created", 5L)));
+    events.onInstallationRepositoriesEvent(
+        event("installation_repositories", "d-ir", buildInstallationPayload("deleted", 5L)));
+    verifyNoInteractions(reviewDispatcher);
   }
 
   @Test
-  void shouldReturn400WithBadJsonBody() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
+  void shouldRouteWithoutMarkingADedupSlotWhenTheDeliveryIdIsAbsent() {
+    var body =
+        buildPullRequestPayload("opened", 2, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
+    when(deduplicator.isDuplicate(null)).thenReturn(false);
 
-    var body = "not-valid-json".getBytes(StandardCharsets.UTF_8);
+    events.routeEvent("pull_request", event("pull_request", null, body));
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    // A delivery id the extension cannot read fails open: routing proceeds rather than dropping
+    // the only chance to review, matching the deduplicator's own fail-open contract.
+    verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
+    verify(deduplicator, never()).forget(anyString());
+  }
 
-    assertEquals(400, response.getStatus());
-    var entity = (String) response.getEntity();
-    assertTrue(entity.contains("Invalid payload"));
+  @Test
+  void shouldIgnorePayloadThatFailsToBind() {
+    // A body that parses as JSON but does not bind to WebhookPayload (action as an object)
+    // must neither throw nor spend a dedup slot: the parse happens before the dedup check.
+    var body = "{\"action\":{}}".getBytes(StandardCharsets.UTF_8);
+
+    assertDoesNotThrow(
+        () -> events.routeEvent("pull_request", event("pull_request", DELIVERY, body)));
+
+    verifyNoInteractions(deduplicator);
+    verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldDropRedeliveredWebhookWithoutDispatching() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 7, "owner/repo", "sha7", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
-    assertEquals(200, response.getStatus());
-    assertTrue(((String) response.getEntity()).contains("ignored"));
     // A redelivery must not start a second review.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldProcessFirstDeliveryAndPassIdToDeduplicator() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 8, "owner/repo", "sha8", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-xyz", body);
+    events.routeEvent("pull_request", event("pull_request", "delivery-xyz", body));
 
-    assertEquals(200, response.getStatus());
     verify(deduplicator).isDuplicate("delivery-xyz");
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
-  void shouldNotConsultDeduplicatorWhenSignatureInvalid() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(false);
-
-    var body = "{}".getBytes(StandardCharsets.UTF_8);
-
-    var response = controller.handleWebhook("sha256=bad", "pull_request", null, "any-id", body);
-
-    assertEquals(401, response.getStatus());
-    // Dedup happens only after the signature is verified, so forged ids cannot poison the cache.
-    verifyNoInteractions(deduplicator);
-  }
-
-  @Test
   void shouldRouteOpenedPullRequestToOrchestrator() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 99, "owner/myrepo", "headsha123", "default")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -239,7 +271,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnorePullRequestWithMissingHead() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     // A pull_request event whose payload omits head (or base) must not NPE — it is ignored.
     var body =
@@ -252,15 +283,13 @@ class WebhookControllerTest {
                 + "\"installation\":{\"id\":12345}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldIgnorePullRequestWithMissingBase() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     // head present, base omitted — the other side of the head/base guard.
     var body =
@@ -273,22 +302,19 @@ class WebhookControllerTest {
                 + "\"installation\":{\"id\":12345}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldRouteSynchronizePullRequestToOrchestrator() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("synchronize", 55, "org/app", "newsha", "develop")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -308,14 +334,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteReopenedPullRequestToOrchestrator() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("reopened", 10, "a/b", "sha10", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -335,7 +359,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteReadyForReviewPullRequestToOrchestrator() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     // A draft marked "Ready for review" fires ready_for_review, not synchronize, so it must
     // dispatch on its own or the PR stays unreviewed until the next push.
@@ -343,8 +366,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("ready_for_review", 21, "org/svc", "sha21", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -364,14 +386,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldDefaultMissingPrBodyToEmptyDescription() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 12, "a/b", "sha12", "main", false)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -391,15 +411,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldSkipAutomaticReviewWhenPrPaused() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(prPauseService.isPaused("owner", "myrepo", 99)).thenReturn(true);
 
     var body =
         buildPullRequestPayload("synchronize", 99, "owner/myrepo", "headsha123", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     // A paused PR must not auto-review on new commits.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -407,13 +425,11 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreClosedPullRequest() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("closed", 1, "x/y", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     // Orchestrator should NOT be called for "closed" action
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -421,7 +437,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnorePullRequestWithNullAction() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         "{"
@@ -431,17 +446,14 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":1}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request", event("pull_request", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldIgnoreOpenedPullRequestWithMissingFields() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         "{"
@@ -451,17 +463,14 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":1}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request", event("pull_request", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldSkipReviewWhenTriggerFilterRejects() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerFilter.skipReason(any(), any()))
         .thenReturn(
             Optional.of(new ReviewTriggerFilter.Skip(ReviewSkipReason.DRAFT, "PR is a draft")));
@@ -470,9 +479,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("opened", 21, "owner/repo", "sha21", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-skip", body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", "delivery-skip", body));
 
     // A filtered-out PR must not be reviewed, and the dedup slot stays claimed (it was a
     // deliberate decision, not a rejected dispatch), so a redelivery is ignored too.
@@ -482,7 +489,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldSkipAutomaticReviewWithinRateLimitWindow() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewConfig.autoReviewMinInterval()).thenReturn(Duration.ofHours(1));
     when(autoReviewRateLimiter.isThrottled("owner", "repo", 55)).thenReturn(true);
 
@@ -491,9 +497,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("synchronize", 55, "owner/repo", "fresh-sha", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-throttled", body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", "delivery-throttled", body));
 
     // A throttled PR must not be reviewed, and the dedup slot stays claimed (a deliberate
     // decision, not a rejected dispatch), so a redelivery is ignored too.
@@ -503,7 +507,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldEmitStructuredSkipEventWhenDraftFilterRejects() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerFilter.skipReason(any(), any()))
         .thenReturn(
             Optional.of(new ReviewTriggerFilter.Skip(ReviewSkipReason.DRAFT, "PR is a draft")));
@@ -512,7 +515,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("opened", 21, "owner/repo", "sha21", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(skipEmitter)
         .recordSkip(eq(ReviewSkipReason.DRAFT), eq("owner"), eq("repo"), eq(21), anyString());
@@ -521,14 +524,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldEmitStructuredSkipEventWhenPrPaused() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(prPauseService.isPaused("owner", "myrepo", 99)).thenReturn(true);
 
     var body =
         buildPullRequestPayload("synchronize", 99, "owner/myrepo", "headsha123", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(skipEmitter)
         .recordSkip(eq(ReviewSkipReason.PAUSED), eq("owner"), eq("myrepo"), eq(99), anyString());
@@ -536,7 +538,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldEmitStructuredSkipEventWhenRateLimited() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewConfig.autoReviewMinInterval()).thenReturn(Duration.ofHours(1));
     when(autoReviewRateLimiter.isThrottled("owner", "repo", 55)).thenReturn(true);
 
@@ -544,7 +545,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("synchronize", 55, "owner/repo", "fresh-sha", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(skipEmitter)
         .recordSkip(
@@ -553,14 +554,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldEmitStructuredSkipEventOnDuplicateDelivery() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 7, "owner/repo", "sha7", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
     verify(skipEmitter)
         .recordSkip(
@@ -569,45 +569,41 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotEmitDuplicateSkipEventForNonReviewRedelivery() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
         buildPullRequestPayload("closed", 7, "owner/repo", "sha7", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldNotEmitDuplicateSkipEventForNonPullRequestRedelivery() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body = "{\"action\":\"created\"}".getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, "redelivered-id", body);
+    events.routeEvent("issue_comment", event("issue_comment", "redelivered-id", body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldNotEmitDuplicateSkipEventWhenRedeliveryHasNoAction() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body = "{}".getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldNotEmitDuplicateSkipEventWhenRedeliveryLacksPullRequest() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
@@ -615,14 +611,13 @@ class WebhookControllerTest {
                 + "\"owner\":{\"login\":\"owner\",\"id\":1}}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldNotEmitDuplicateSkipEventWhenRedeliveryLacksRepositoryOwner() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
@@ -630,36 +625,32 @@ class WebhookControllerTest {
                 + "\"repository\":{\"full_name\":\"owner/repo\",\"name\":\"repo\"}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldNotEmitDuplicateSkipEventWhenRedeliveryLacksRepository() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(deduplicator.isDuplicate("redelivered-id")).thenReturn(true);
 
     var body =
         "{\"action\":\"opened\",\"pull_request\":{\"number\":7}}".getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "pull_request", null, "redelivered-id", body);
+    events.routeEvent("pull_request", event("pull_request", "redelivered-id", body));
 
-    assertEquals(200, response.getStatus());
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldEmitStructuredSkipEventWhenDispatchRejected() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewDispatcher.dispatch(any(ReviewOrchestrator.ReviewRequest.class))).thenReturn(false);
 
     var body =
         buildPullRequestPayload("opened", 8, "owner/repo", "sha8", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-rejected", body);
+    events.routeEvent("pull_request", event("pull_request", "delivery-rejected", body));
 
     verify(skipEmitter)
         .recordSkip(
@@ -670,28 +661,26 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotEmitSkipEventWhenReviewDispatches() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewDispatcher.dispatch(any(ReviewOrchestrator.ReviewRequest.class))).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 8, "owner/repo", "sha8", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verifyNoInteractions(skipEmitter);
   }
 
   @Test
   void shouldDispatchAutomaticReviewWhenRateLimitWindowOpen() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(autoReviewRateLimiter.isThrottled("owner", "repo", 56)).thenReturn(false);
 
     var body =
         buildPullRequestPayload("synchronize", 56, "owner/repo", "sha56", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(autoReviewRateLimiter).isThrottled("owner", "repo", 56);
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -699,7 +688,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldClearRateLimitAndDispatchReadyForReviewEvenWhenThrottled() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewConfig.autoReviewMinInterval()).thenReturn(Duration.ofHours(1));
     when(autoReviewRateLimiter.isThrottled("org", "svc", 57)).thenReturn(true);
 
@@ -707,23 +695,21 @@ class WebhookControllerTest {
         buildPullRequestPayload("ready_for_review", 57, "org/svc", "sha57", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(autoReviewRateLimiter).clearForPr("org", "svc", 57);
     verify(autoReviewRateLimiter, never()).isThrottled("org", "svc", 57);
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
-  /** A controller gating on the real filter with {@code dependencies} excluded (#1021). */
-  private WebhookController excludingDependencies() {
-    return newController(
+  /** A listener gating on the real filter with {@code dependencies} excluded (#1021). */
+  private WebhookEvents excludingDependencies() {
+    return newEvents(
         new ReviewTriggerFilter(false, List.of(), List.of("dependencies"), List.of(), List.of()));
   }
 
   @Test
   void dependabotOpenedPayloadWithoutLabelsIsSkippedOnTheLabelsReadFromTheApi() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     // Dependabot opens the pull request, then labels it: the opened payload has no labels.
     when(labelGate.currentLabels(12345L, "owner", "repo", 1012))
         .thenReturn(Optional.of(List.of("dependencies", "java")));
@@ -731,7 +717,7 @@ class WebhookControllerTest {
         buildPullRequestPayload("opened", 1012, "owner/repo", "sha1012", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    excludingDependencies().handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    excludingDependencies().routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(skipEmitter)
         .recordSkip(
@@ -742,14 +728,13 @@ class WebhookControllerTest {
   @ParameterizedTest
   @MethodSource("labelReadingActions")
   void reopenedAndReadyForReviewAlsoReadTheLabelsFromTheApi(String action) {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(labelGate.currentLabels(12345L, "owner", "repo", 7))
         .thenReturn(Optional.of(List.of("Dependencies")));
     var body =
         buildPullRequestPayload(action, 7, "owner/repo", "sha7", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    excludingDependencies().handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    excludingDependencies().routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
@@ -760,7 +745,6 @@ class WebhookControllerTest {
 
   @Test
   void anUnreadableLabelSetFallsBackToThePayloadLabels() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(labelGate.currentLabels(anyLong(), anyString(), anyString(), anyInt()))
         .thenReturn(Optional.empty());
     var labelled = labelledOpenedPayload(8, "dependencies");
@@ -769,8 +753,8 @@ class WebhookControllerTest {
             .getBytes(StandardCharsets.UTF_8);
     var gated = excludingDependencies();
 
-    gated.handleWebhook("sha256=valid", "pull_request", null, "d-8", labelled);
-    gated.handleWebhook("sha256=valid", "pull_request", null, "d-9", unlabelled);
+    gated.routeEvent("pull_request", event("pull_request", "d-8", labelled));
+    gated.routeEvent("pull_request", event("pull_request", "d-9", unlabelled));
 
     verify(skipEmitter)
         .recordSkip(
@@ -782,12 +766,11 @@ class WebhookControllerTest {
 
   @Test
   void synchronizeGatesOnThePayloadLabelsWithoutAnApiRead() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     var body =
         buildPullRequestPayload("synchronize", 10, "owner/repo", "sha10", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    excludingDependencies().handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    excludingDependencies().routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verifyNoInteractions(labelGate);
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -795,13 +778,12 @@ class WebhookControllerTest {
 
   @Test
   void noLabelGateMeansNoApiRead() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     var body =
         buildPullRequestPayload("opened", 11, "owner/repo", "sha11", "main")
             .getBytes(StandardCharsets.UTF_8);
 
-    newController(new ReviewTriggerFilter(false, List.of(), List.of(), List.of(), List.of()))
-        .handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    newEvents(new ReviewTriggerFilter(false, List.of(), List.of(), List.of(), List.of()))
+        .routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     verifyNoInteractions(labelGate);
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -817,7 +799,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldPassParsedDraftAndLabelsToTriggerFilter() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         ("{"
@@ -832,7 +813,7 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     var captor = ArgumentCaptor.forClass(WebhookPayload.PullRequest.class);
     verify(triggerFilter).skipReason(captor.capture(), any());
@@ -846,7 +827,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldTriggerManualReviewOnReviewCommand() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(manualReviewAuthorizer.isAuthorized("owner", "repo", 12345L, "octocat", "OWNER"))
@@ -856,8 +836,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatch(
@@ -867,7 +846,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldTriggerManualReviewEvenWithinRateLimitWindow() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(manualReviewAuthorizer.isAuthorized("owner", "repo", 12345L, "octocat", "OWNER"))
@@ -877,8 +855,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // An explicit /review always runs — the manual path never consults the rate limiter, so
     // even a PR deep inside the throttle window is reviewed on request.
@@ -891,7 +868,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreUnauthorizedManualReviewTrigger() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("stranger")).thenReturn(false);
     when(manualReviewAuthorizer.isAuthorized(
@@ -902,8 +878,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 88, "owner/repo", "stranger", "/review", "NONE")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // A user without write access must not be able to spend the operator's API budget.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -911,7 +886,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldSkipManualReviewOnPausedPr() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(prPauseService.isPaused("owner", "repo", 77)).thenReturn(true);
@@ -920,8 +894,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // A paused PR neither authorizes nor dispatches the review; it just posts the paused notice.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -931,7 +904,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteNonReviewCommandsToCommandService() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/help")).thenReturn(CommentCommand.HELP);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
@@ -939,8 +911,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/help")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     var ctx = org.mockito.ArgumentCaptor.forClass(CommentCommandService.CommandContext.class);
     verify(commentCommandService).handle(ctx.capture());
@@ -956,7 +927,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteAddDocsCommandToCommandService() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/add-docs")).thenReturn(CommentCommand.ADD_DOCS);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
@@ -964,8 +934,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/add-docs")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     var ctx = org.mockito.ArgumentCaptor.forClass(CommentCommandService.CommandContext.class);
     verify(commentCommandService).handle(ctx.capture());
@@ -977,7 +946,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteImproveCommandToCommandServiceAndAckIt() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/improve")).thenReturn(CommentCommand.IMPROVE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
@@ -985,8 +953,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/improve")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     var ctx = org.mockito.ArgumentCaptor.forClass(CommentCommandService.CommandContext.class);
     verify(commentCommandService).handle(ctx.capture());
@@ -1001,7 +968,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRouteGenerateTestsCommandToCommandService() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/generate-tests"))
         .thenReturn(CommentCommand.GENERATE_TESTS);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
@@ -1010,8 +976,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/generate-tests")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     var ctx = org.mockito.ArgumentCaptor.forClass(CommentCommandService.CommandContext.class);
     verify(commentCommandService).handle(ctx.capture());
@@ -1025,7 +990,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldAddEyesReactionOnReviewCommand() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(manualReviewAuthorizer.isAuthorized("owner", "repo", 12345L, "octocat", "OWNER"))
@@ -1035,7 +999,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(ackReactionService)
         .addEyes(12345L, "owner", "repo", 1L, AckReactionService.CommentKind.ISSUE);
@@ -1043,7 +1007,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldAddEyesReactionOnNonReviewCommand() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/help")).thenReturn(CommentCommand.HELP);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
@@ -1051,7 +1014,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/help")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(ackReactionService)
         .addEyes(12345L, "owner", "repo", 1L, AckReactionService.CommentKind.ISSUE);
@@ -1059,7 +1022,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldAddEyesReactionEvenWhenReviewUnauthorized() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("stranger")).thenReturn(false);
     when(manualReviewAuthorizer.isAuthorized(
@@ -1070,7 +1032,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 88, "owner/repo", "stranger", "/review", "NONE")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // The ack fires before authorization: the commenter still sees the command was noticed even
     // when it is then rejected.
@@ -1081,7 +1043,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldAddEyesReactionOnReviewCommandOnPausedPr() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(prPauseService.isPaused("owner", "repo", 77)).thenReturn(true);
@@ -1090,7 +1051,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 77, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // The ack also precedes the pause gate — the command itself was still seen.
     verify(ackReactionService)
@@ -1099,7 +1060,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotReactOnConversationalMention() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("@thrillhousebot is this thread-safe?"))
         .thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
@@ -1112,7 +1072,7 @@ class WebhookControllerTest {
                 "created", 77, "owner/repo", "octocat", "@thrillhousebot is this thread-safe?")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // A bare conversational mention is not a command — no 👀 ack, only the reply.
     verify(replyDispatcher).dispatch(any(MaintainerReplyService.ReplyTask.class));
@@ -1121,7 +1081,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotReactOnReviewThreadMention() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot why is this flagged?"))
         .thenReturn(true);
@@ -1138,7 +1097,8 @@ class WebhookControllerTest {
                 1000L)
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     // An inline-thread mention is conversational, never a command — no 👀 ack.
     verify(replyDispatcher).dispatch(any(MaintainerReplyService.ReplyTask.class));
@@ -1147,7 +1107,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotReactWhenCommandInstallationMissing() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/help")).thenReturn(CommentCommand.HELP);
     when(triggerDetector.isBotComment("user")).thenReturn(false);
 
@@ -1161,7 +1120,7 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // Without an installation there is no token to react with.
     verifyNoInteractions(ackReactionService);
@@ -1169,14 +1128,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreEditedIssueComment() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildIssueCommentPayload("edited", 88, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // Editing a comment must not re-dispatch a review, and authorization is never consulted.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1185,14 +1142,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreDeletedIssueComment() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildIssueCommentPayload("deleted", 88, "owner/repo", "octocat", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // Deleting a comment must not re-dispatch a review.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1201,7 +1156,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreIssueCommentWithoutTrigger() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("Nice PR!")).thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
@@ -1209,8 +1163,7 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 1, "a/b", "octocat", "Nice PR!")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // Neither the dispatcher nor the command service runs when no command is detected.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1219,15 +1172,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreBotComment() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("thrillhousebot[bot]")).thenReturn(true);
 
     var body =
         buildIssueCommentPayload("created", 1, "a/b", "thrillhousebot[bot]", "/review")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // The bot's own comment is dropped before command detection, so nothing runs.
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1236,7 +1187,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldDispatchReplyForBotMentionOnPrComment() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("@thrillhousebot is this thread-safe?"))
         .thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
@@ -1249,8 +1199,7 @@ class WebhookControllerTest {
                 "created", 77, "owner/repo", "octocat", "@thrillhousebot is this thread-safe?")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(replyDispatcher)
         .dispatch(
@@ -1275,7 +1224,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldSkipConversationalMentionOnPausedPr() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("@thrillhousebot is this thread-safe?"))
         .thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
@@ -1288,8 +1236,7 @@ class WebhookControllerTest {
                 "created", 77, "owner/repo", "octocat", "@thrillhousebot is this thread-safe?")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     // /pause silences the bot, so a mention must not spend a paid conversational reply.
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
@@ -1297,7 +1244,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotDispatchReplyForMentionWhenRepliesDisabled() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewConfig.conversationalRepliesEnabled()).thenReturn(false);
     when(triggerDetector.detectCommand("@thrillhousebot hi")).thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
@@ -1306,15 +1252,13 @@ class WebhookControllerTest {
         buildIssueCommentPayload("created", 5, "owner/repo", "octocat", "@thrillhousebot hi")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
 
   @Test
   void shouldDispatchReplyForReviewCommentMentionInReply() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot why is this flagged?"))
         .thenReturn(true);
@@ -1333,10 +1277,8 @@ class WebhookControllerTest {
                 1000L)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(findingFeedbackCapture)
         .scheduleCaptureOnReviewReply(
@@ -1369,7 +1311,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldCaptureFindingFeedbackOnReviewReplyWithoutBotMention() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("not useful")).thenReturn(false);
 
@@ -1377,10 +1318,8 @@ class WebhookControllerTest {
         buildReviewCommentPayload("created", 42, "owner/repo", "octocat", "not useful", 99L, 1001L)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(findingFeedbackCapture)
         .scheduleCaptureOnReviewReply(
@@ -1395,7 +1334,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldDispatchReplyForReviewCommentMentionOnNewLine() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot thoughts?")).thenReturn(true);
     when(replyDispatcher.dispatch(any(MaintainerReplyService.ReplyTask.class))).thenReturn(true);
@@ -1406,10 +1344,8 @@ class WebhookControllerTest {
                 "created", 42, "owner/repo", "octocat", "@thrillhousebot thoughts?", null, 2000L)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(replyDispatcher)
         .dispatch(
@@ -1432,7 +1368,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldSkipReviewCommentReplyOnPausedPr() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot why is this flagged?"))
         .thenReturn(true);
@@ -1450,10 +1385,8 @@ class WebhookControllerTest {
                 1000L)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     // /pause silences the bot, so a review-thread reply must not spend a paid conversational reply.
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
@@ -1462,7 +1395,6 @@ class WebhookControllerTest {
   @ParameterizedTest
   @EnumSource(IgnoredReviewComment.class)
   void shouldIgnoreReviewCommentWithoutDispatching(IgnoredReviewComment scenario) {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     scenario.applySetup(triggerDetector, reviewConfig);
 
     var body =
@@ -1476,10 +1408,8 @@ class WebhookControllerTest {
                 scenario.commentId)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
@@ -1536,16 +1466,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreEditedReviewComment() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildReviewCommentPayload("edited", 42, "owner/repo", "octocat", "edited text", 99L, 5000L)
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     // Editing a review comment must not re-trigger a reply.
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
@@ -1555,19 +1482,13 @@ class WebhookControllerTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("reviewCommentsWithMissingFields")
   void shouldIgnoreReviewCommentWithMissingFields(String name, String body) {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     // A present author reaches the bot-loop guard; the null-author/null-comment cases short-circuit
     // before it, so this stub is simply unused for them.
     when(triggerDetector.isBotComment(anyString())).thenReturn(false);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid",
-            "pull_request_review_comment",
-            null,
-            DELIVERY,
-            body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus(), name);
+    events.routeEvent(
+        "pull_request_review_comment",
+        event("pull_request_review_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
@@ -1605,7 +1526,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreReviewCommentWithMissingRepository() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
     // pull_request present but repository missing — exercises the second operand of the guard.
@@ -1619,17 +1539,14 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
 
   @Test
   void shouldIgnoreReviewCommentWithMissingInstallation() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
 
     // pull_request and repository present, but installation missing — exercises the third
@@ -1644,17 +1561,14 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "pull_request_review_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "pull_request_review_comment", event("pull_request_review_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
 
   @Test
   void shouldIgnoreMentionWithMissingInstallation() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("@thrillhousebot hi")).thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot hi")).thenReturn(true);
@@ -1670,15 +1584,13 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
 
   @Test
   void shouldIgnoreMentionWithMissingRepository() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("@thrillhousebot hi")).thenReturn(CommentCommand.NONE);
     when(triggerDetector.isBotComment("octocat")).thenReturn(false);
     when(triggerDetector.containsBotMention("@thrillhousebot hi")).thenReturn(true);
@@ -1693,71 +1605,60 @@ class WebhookControllerTest {
                 + "}")
             .getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "issue_comment", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("issue_comment", event("issue_comment", DELIVERY, body));
 
     verify(replyDispatcher, never()).dispatch(any(MaintainerReplyService.ReplyTask.class));
   }
 
   @Test
   void shouldHandleInstallationEvent() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body = buildInstallationPayload("created", 12345L).getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "installation", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("installation", event("installation", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldHandleInstallationRepositoriesEvent() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body = buildInstallationPayload("added", 42L).getBytes(StandardCharsets.UTF_8);
 
-    var response =
-        controller.handleWebhook("sha256=valid", "installation_repositories", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "installation_repositories", event("installation_repositories", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldHandleInstallationEventWithoutInstallationId() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     // Payload with action but no installation field
     var body = "{\"action\":\"created\"}".getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "installation", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("installation", event("installation", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldHandlePingEvent() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body = "{}".getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "ping", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("ping", event("ping", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldHandleUnknownEventType() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 1, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "push", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("push", event("push", DELIVERY, body));
 
     // Orchestrator should NOT be called for unknown event types
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1765,7 +1666,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldCatchRuntimeExceptionInRouteEvent() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     doThrow(new RuntimeException("simulated failure"))
         .when(reviewDispatcher)
         .dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1773,8 +1673,7 @@ class WebhookControllerTest {
     var body =
         buildPullRequestPayload("opened", 1, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "pull_request", null, DELIVERY, body);
-    assertEquals(200, response.getStatus());
+    events.routeEvent("pull_request", event("pull_request", DELIVERY, body));
 
     // The async routeEvent should have caught the RuntimeException and logged it
     verify(reviewDispatcher).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1782,16 +1681,14 @@ class WebhookControllerTest {
 
   @Test
   void shouldRecheckHeldVerdictWhenCheckSuiteCompletes() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of(7));
     when(reviewDispatcher.dispatchCiRecheck(any())).thenReturn(true);
 
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    var response = controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
-    assertEquals(200, response.getStatus());
     verify(reviewDispatcher)
         .dispatchCiRecheck(new CiHoldRevisit.Recheck("a", "b", 7, "abc123", 1L));
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -1800,14 +1697,13 @@ class WebhookControllerTest {
 
   @Test
   void shouldRecheckEveryPullRequestHeldAtTheCompletedHead() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of(7, 8));
     when(reviewDispatcher.dispatchCiRecheck(any())).thenReturn(true);
 
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatchCiRecheck(new CiHoldRevisit.Recheck("a", "b", 7, "abc123", 1L));
@@ -1817,25 +1713,23 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreCheckSuiteWhenNoVerdictIsHeldAtItsHead() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of());
 
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
     verify(reviewDispatcher, never()).dispatchCiRecheck(any());
   }
 
   @Test
   void shouldIgnoreCheckSuiteThatIsNotCompleted() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         buildCheckSuitePayload("requested", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
     verifyNoInteractions(ciHoldRegistry);
     verify(reviewDispatcher, never()).dispatchCiRecheck(any());
@@ -1843,13 +1737,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreTheBotsOwnCheckSuite() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(githubConfig.appId()).thenReturn("99");
 
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
     verifyNoInteractions(ciHoldRegistry);
     verify(reviewDispatcher, never()).dispatchCiRecheck(any());
@@ -1858,10 +1751,9 @@ class WebhookControllerTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("incompleteCheckSuitePayloads")
   void shouldIgnoreCheckSuiteWithMissingFields(String name, String payload) {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
-    controller.handleWebhook(
-        "sha256=valid", "check_suite", null, DELIVERY, payload.getBytes(StandardCharsets.UTF_8));
+    events.routeEvent(
+        "check_suite", event("check_suite", DELIVERY, payload.getBytes(StandardCharsets.UTF_8)));
 
     verifyNoInteractions(ciHoldRegistry);
     verify(reviewDispatcher, never()).dispatchCiRecheck(any());
@@ -1900,7 +1792,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldRecheckOnAnotherAppsCheckSuiteWhenOwnAppIdIsConfigured() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(githubConfig.appId()).thenReturn("12345");
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of(7));
     when(reviewDispatcher.dispatchCiRecheck(any())).thenReturn(true);
@@ -1908,7 +1799,7 @@ class WebhookControllerTest {
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, DELIVERY, body);
+    events.routeEvent("check_suite", event("check_suite", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatchCiRecheck(new CiHoldRevisit.Recheck("a", "b", 7, "abc123", 1L));
@@ -1916,7 +1807,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreCommitStatusWithoutState() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         ("{\"sha\":\"abc123\",\"context\":\"ci\","
@@ -1924,34 +1814,32 @@ class WebhookControllerTest {
                 + ",\"installation\":{\"id\":1}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "status", null, DELIVERY, body);
+    events.routeEvent("status", event("status", DELIVERY, body));
 
     verifyNoInteractions(ciHoldRegistry);
   }
 
   @Test
   void shouldForgetDeliveryIdWhenCiRecheckDispatchIsRejected() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of(7));
     when(reviewDispatcher.dispatchCiRecheck(any())).thenReturn(false);
 
     var body =
         buildCheckSuitePayload("completed", "a/b", "abc123", 99L).getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "check_suite", null, "delivery-ci", body);
+    events.routeEvent("check_suite", event("check_suite", "delivery-ci", body));
 
     verify(deduplicator).forget("delivery-ci");
   }
 
   @Test
   void shouldRecheckHeldVerdictWhenCommitStatusSettles() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(ciHoldRegistry.pullRequestsAt("a", "b", "abc123")).thenReturn(List.of(7));
     when(reviewDispatcher.dispatchCiRecheck(any())).thenReturn(true);
 
     var body = buildStatusPayload("a/b", "abc123", "success").getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "status", null, DELIVERY, body);
+    events.routeEvent("status", event("status", DELIVERY, body));
 
     verify(reviewDispatcher)
         .dispatchCiRecheck(new CiHoldRevisit.Recheck("a", "b", 7, "abc123", 1L));
@@ -1959,11 +1847,10 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnorePendingCommitStatus() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body = buildStatusPayload("a/b", "abc123", "pending").getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "status", null, DELIVERY, body);
+    events.routeEvent("status", event("status", DELIVERY, body));
 
     verifyNoInteractions(ciHoldRegistry);
     verify(reviewDispatcher, never()).dispatchCiRecheck(any());
@@ -1971,7 +1858,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreCommitStatusWithoutSha() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         ("{\"state\":\"success\",\"context\":\"ci\","
@@ -1979,7 +1865,7 @@ class WebhookControllerTest {
                 + ",\"installation\":{\"id\":1}}")
             .getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "status", null, DELIVERY, body);
+    events.routeEvent("status", event("status", DELIVERY, body));
 
     verifyNoInteractions(ciHoldRegistry);
   }
@@ -2020,7 +1906,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldForgetDeliveryIdWhenDispatchIsRejected() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     // A saturated executor makes dispatch return false (it does not throw — the dispatcher
     // swallows RejectedExecutionException), which is the real scenario.
     when(reviewDispatcher.dispatch(any(ReviewOrchestrator.ReviewRequest.class))).thenReturn(false);
@@ -2028,7 +1913,7 @@ class WebhookControllerTest {
     var body =
         buildPullRequestPayload("opened", 1, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-abc", body);
+    events.routeEvent("pull_request", event("pull_request", "delivery-abc", body));
 
     // The rejected dispatch must roll back the dedup slot so manual redelivery can retry.
     verify(deduplicator).forget("delivery-abc");
@@ -2036,7 +1921,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldForgetDeliveryIdWhenDispatchThrows() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     doThrow(new RuntimeException("unexpected failure"))
         .when(reviewDispatcher)
         .dispatch(any(ReviewOrchestrator.ReviewRequest.class));
@@ -2044,7 +1928,7 @@ class WebhookControllerTest {
     var body =
         buildPullRequestPayload("opened", 1, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-throw", body);
+    events.routeEvent("pull_request", event("pull_request", "delivery-throw", body));
 
     // An unexpected RuntimeException must also roll back the dedup slot for the same reason.
     verify(deduplicator).forget("delivery-throw");
@@ -2052,13 +1936,12 @@ class WebhookControllerTest {
 
   @Test
   void shouldNotForgetDeliveryIdWhenDispatchSucceeds() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(reviewDispatcher.dispatch(any(ReviewOrchestrator.ReviewRequest.class))).thenReturn(true);
 
     var body =
         buildPullRequestPayload("opened", 1, "a/b", "sha", "main").getBytes(StandardCharsets.UTF_8);
 
-    controller.handleWebhook("sha256=valid", "pull_request", null, "delivery-ok", body);
+    events.routeEvent("pull_request", event("pull_request", "delivery-ok", body));
 
     // A successful dispatch keeps the dedup slot so redeliveries stay suppressed.
     verify(deduplicator, never()).forget(anyString());
@@ -2066,7 +1949,6 @@ class WebhookControllerTest {
 
   @Test
   void shouldIgnoreIssueCommentWhenIssueMissing() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         "{"
@@ -2077,10 +1959,8 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":12345}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "issue_comment", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "issue_comment", event("issue_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
@@ -2088,7 +1968,6 @@ class WebhookControllerTest {
   @Test
   void shouldIgnoreIssueCommentOnPlainIssue() {
     // An issue comment without pull_request field (plain issue, not PR)
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.isBotComment("user")).thenReturn(false);
 
     var body =
@@ -2100,17 +1979,14 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":12345}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "issue_comment", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "issue_comment", event("issue_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldIgnoreIssueCommentWithMissingAuthor() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
 
     var body =
         "{"
@@ -2121,17 +1997,14 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":1}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "issue_comment", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "issue_comment", event("issue_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldIgnoreReviewTriggerWithMissingRepository() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/review")).thenReturn(CommentCommand.REVIEW);
     when(triggerDetector.isBotComment("user")).thenReturn(false);
 
@@ -2144,17 +2017,14 @@ class WebhookControllerTest {
             + "\"installation\":{\"id\":1}"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "issue_comment", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "issue_comment", event("issue_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     verify(reviewDispatcher, never()).dispatch(any(ReviewOrchestrator.ReviewRequest.class));
   }
 
   @Test
   void shouldIgnoreCommandWhenInstallationMissing() {
-    when(verifier.verify(anyString(), any(byte[].class), anyString())).thenReturn(true);
     when(triggerDetector.detectCommand("/help")).thenReturn(CommentCommand.HELP);
     when(triggerDetector.isBotComment("user")).thenReturn(false);
 
@@ -2167,10 +2037,8 @@ class WebhookControllerTest {
             + "\"installation\":null"
             + "}";
 
-    var response =
-        controller.handleWebhook(
-            "sha256=valid", "issue_comment", null, DELIVERY, body.getBytes(StandardCharsets.UTF_8));
-    assertEquals(200, response.getStatus());
+    events.routeEvent(
+        "issue_comment", event("issue_comment", DELIVERY, body.getBytes(StandardCharsets.UTF_8)));
 
     // A command with no installation cannot be authenticated to GitHub, so nothing runs.
     verifyNoInteractions(commentCommandService);

@@ -28,22 +28,35 @@ import dev.thiagogonzaga.thrillhousebot.review.ReviewDispatcher;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewOrchestrator;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewSkipEmitter;
 import dev.thiagogonzaga.thrillhousebot.review.ReviewSkipReason;
+import io.quarkiverse.githubapp.GitHubEvent;
+import io.quarkiverse.githubapp.event.CheckSuite;
+import io.quarkiverse.githubapp.event.IssueComment;
+import io.quarkiverse.githubapp.event.Ping;
+import io.quarkiverse.githubapp.event.PullRequest;
+import io.quarkiverse.githubapp.event.PullRequestReviewComment;
+import io.quarkiverse.githubapp.event.RawEvent;
+import io.quarkiverse.githubapp.event.Status;
 import jakarta.inject.Inject;
-import jakarta.ws.rs.*;
-import jakarta.ws.rs.core.MediaType;
-import jakarta.ws.rs.core.Response;
 import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@Path("/api/webhook")
-@Produces(MediaType.APPLICATION_JSON)
-@Consumes(MediaType.APPLICATION_JSON)
-public class WebhookController {
+/**
+ * The webhook entry: the Quarkiverse GitHub App extension verifies the {@code X-Hub-Signature-256}
+ * over the raw body, parses the delivery and routes it to the observers below on the same {@code
+ * POST /api/webhook} path the former {@code WebhookController} served. Business routing is
+ * unchanged: dedupe, pause state, trigger filters, per-PR dispatch serialization and the comment
+ * commands keep their exact callers and semantics.
+ *
+ * <p>Each observer method receives the raw {@link GitHubEvent}: no typed payload is bound and no
+ * installation client is created on the ACK path, so a delivery costs no GitHub call before the
+ * routing decides otherwise.
+ */
+public class WebhookEvents {
 
-  private static final Logger log = LoggerFactory.getLogger(WebhookController.class);
+  private static final Logger log = LoggerFactory.getLogger(WebhookEvents.class);
 
   private static final String ACTION_READY_FOR_REVIEW = "ready_for_review";
   private static final String ACTION_SYNCHRONIZE = "synchronize";
@@ -52,8 +65,9 @@ public class WebhookController {
   private static final Set<String> AUTO_REVIEW_ACTIONS =
       Set.of("opened", "reopened", ACTION_SYNCHRONIZE, ACTION_READY_FOR_REVIEW);
 
+  private static final String EVENT_PULL_REQUEST = "pull_request";
+
   private final ThrillhouseConfig config;
-  private final WebhookVerifier verifier;
   private final TriggerDetector triggerDetector;
   private final ReviewTriggerFilter triggerFilter;
   private final PullRequestLabelGate labelGate;
@@ -71,9 +85,8 @@ public class WebhookController {
   private final ObjectMapper mapper;
 
   @Inject
-  public WebhookController(
+  public WebhookEvents(
       ThrillhouseConfig config,
-      WebhookVerifier verifier,
       TriggerDetector triggerDetector,
       ReviewTriggerFilter triggerFilter,
       PullRequestLabelGate labelGate,
@@ -90,7 +103,6 @@ public class WebhookController {
       CiHoldRegistry ciHoldRegistry,
       ObjectMapper mapper) {
     this.config = config;
-    this.verifier = verifier;
     this.triggerDetector = triggerDetector;
     this.triggerFilter = triggerFilter;
     this.labelGate = labelGate;
@@ -108,43 +120,107 @@ public class WebhookController {
     this.mapper = mapper;
   }
 
-  @POST
-  public Response handleWebhook(
-      @HeaderParam("X-Hub-Signature-256") String signature,
-      @HeaderParam("X-GitHub-Event") String eventType,
-      @HeaderParam("X-GitHub-Hook-Installation-Target-Type") String targetType,
-      @HeaderParam("X-GitHub-Delivery") String deliveryId,
-      byte[] body) {
-    if (!verifier.verify(signature, body, config.github().webhookSecret())) {
-      return Response.status(Response.Status.UNAUTHORIZED)
-          .entity("{\"error\":\"Invalid signature\"}")
-          .build();
-    }
+  void onPullRequest(
+      @PullRequest.Opened @PullRequest.Reopened @PullRequest.Synchronize @PullRequest.ReadyForReview
+          GitHubEvent event) {
+    routeEvent("pull_request", event);
+  }
 
-    WebhookPayload payload;
-    try {
-      payload = mapper.readValue(body, WebhookPayload.class);
-    } catch (IOException e) {
-      log.error("Failed to parse webhook payload", e);
-      return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"Invalid payload\"}")
-          .build();
+  void onIssueComment(@IssueComment.Created GitHubEvent event) {
+    routeEvent("issue_comment", event);
+  }
+
+  void onReviewComment(@PullRequestReviewComment.Created GitHubEvent event) {
+    routeEvent("pull_request_review_comment", event);
+  }
+
+  void onCheckSuiteCompleted(@CheckSuite.Completed GitHubEvent event) {
+    routeEvent("check_suite", event);
+  }
+
+  void onStatus(@Status GitHubEvent event) {
+    routeEvent("status", event);
+  }
+
+  void onPing(@Ping GitHubEvent event) {
+    log.info("Webhook ping received");
+  }
+
+  void onInstallationEvent(@RawEvent(event = "installation") GitHubEvent event) {
+    logInstallationPayload(event);
+  }
+
+  void onInstallationRepositoriesEvent(
+      @RawEvent(event = "installation_repositories") GitHubEvent event) {
+    logInstallationPayload(event);
+  }
+
+  private void logInstallationPayload(GitHubEvent event) {
+    var payload = parsePayload(event);
+    if (payload == null) {
+      return;
+    }
+    log.info(
+        "App installation event (action: {}), installation id: {}",
+        payload.action(),
+        payload.installation() != null ? payload.installation().id() : "unknown");
+  }
+
+  /**
+   * Routes one delivery the same way the controller always did: parse, dedupe against the delivery
+   * id, then business handling. Visible for tests.
+   */
+  void routeEvent(String eventType, GitHubEvent event) {
+    WebhookPayload payload = parsePayload(event);
+    if (payload == null) {
+      return;
     }
 
     log.info(
-        "Received {} event (action: {}, delivery: {})", eventType, payload.action(), deliveryId);
+        "Received {} event (action: {}, delivery: {})",
+        eventType,
+        payload.action(),
+        event.getDeliveryId());
 
     // GitHub redeliveries (manual or automatic retry) reuse the same delivery id.
-    if (deduplicator.isDuplicate(deliveryId)) {
-      log.info("Ignoring redelivered {} event (delivery: {})", eventType, deliveryId);
-      recordDuplicateAutoReviewSkip(eventType, payload, deliveryId);
-      return Response.ok("{\"status\":\"ignored\"}").build();
+    if (deduplicator.isDuplicate(event.getDeliveryId())) {
+      log.info("Ignoring redelivered {} event (delivery: {})", eventType, event.getDeliveryId());
+      recordDuplicateAutoReviewSkip(eventType, payload, event.getDeliveryId());
+      return;
     }
 
-    routeEvent(eventType, payload, deliveryId);
+    try {
+      boolean handled = handle(eventType, payload);
+      if (!handled) {
+        deduplicator.forget(event.getDeliveryId());
+      }
+    } catch (RuntimeException e) {
+      deduplicator.forget(event.getDeliveryId());
+      log.error("Error processing webhook event", e);
+    }
+  }
 
-    // GitHub expects a 200 within 10 seconds.
-    return Response.ok("{\"status\":\"ok\"}").build();
+  private boolean handle(String eventType, WebhookPayload payload) {
+    return switch (eventType) {
+      case "pull_request" -> handlePullRequest(payload);
+      case "issue_comment" -> handleIssueComment(payload);
+      case "pull_request_review_comment" -> handleReviewComment(payload);
+      case "check_suite" -> handleCheckSuite(payload);
+      case "status" -> handleStatus(payload);
+      default -> {
+        log.debug("Unhandled event type: {}", eventType);
+        yield true;
+      }
+    };
+  }
+
+  private WebhookPayload parsePayload(GitHubEvent event) {
+    try {
+      return mapper.readValue(event.getParsedPayload().encode(), WebhookPayload.class);
+    } catch (IOException e) {
+      log.error("Failed to parse webhook payload", e);
+      return null;
+    }
   }
 
   /**
@@ -153,7 +229,7 @@ public class WebhookController {
    */
   private void recordDuplicateAutoReviewSkip(
       String eventType, WebhookPayload payload, String deliveryId) {
-    if (!"pull_request".equals(eventType)
+    if (!EVENT_PULL_REQUEST.equals(eventType)
         || payload.action() == null
         || !AUTO_REVIEW_ACTIONS.contains(payload.action())) {
       return;
@@ -169,40 +245,6 @@ public class WebhookController {
         repo.name(),
         pr.number(),
         "redelivered webhook (delivery: " + deliveryId + ")");
-  }
-
-  private void routeEvent(String eventType, WebhookPayload payload, String deliveryId) {
-    try {
-      boolean handled =
-          switch (eventType) {
-            case "pull_request" -> handlePullRequest(payload);
-            case "issue_comment" -> handleIssueComment(payload);
-            case "pull_request_review_comment" -> handleReviewComment(payload);
-            case "check_suite" -> handleCheckSuite(payload);
-            case "status" -> handleStatus(payload);
-            case "installation", "installation_repositories" -> {
-              log.info(
-                  "App installation event (action: {}), installation id: {}",
-                  payload.action(),
-                  payload.installation() != null ? payload.installation().id() : "unknown");
-              yield true;
-            }
-            case "ping" -> {
-              log.info("Webhook ping received");
-              yield true;
-            }
-            default -> {
-              log.debug("Unhandled event type: {}", eventType);
-              yield true;
-            }
-          };
-      if (!handled) {
-        deduplicator.forget(deliveryId);
-      }
-    } catch (RuntimeException e) {
-      deduplicator.forget(deliveryId);
-      log.error("Error processing webhook event", e);
-    }
   }
 
   /**
