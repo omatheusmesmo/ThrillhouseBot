@@ -154,6 +154,12 @@ cannot resolve its review threads.
   write in, so a model could answer an English pull request with a summary in another one. Every
   prompt now asks for English prose, with code, identifiers, paths and quotations left as they are.
   That includes replies and the `/describe`, `/changelog`, `/add-docs`, `/improve` and `/generate-tests` commands.
+- **The review body's list of findings without a thread renders like the summary** (#1438): code
+  quoted in a description, indented by two spaces or more, shows as a code block inside its bullet,
+  each bullet carries the finding's confidence note, and a bare carriage return can no longer end a
+  bullet. The list of lower-confidence items sends the reader to **Things to double-check** only
+  when this round's summary comment was written with them, and otherwise says the review itself
+  lists them.
 - **A review that outlives its installation token switches to the new one** (#1431): the first
   call GitHub rejects still gets a replacement and is repeated, and every later call made with the
   old token now sends that replacement. Before, each of them drew its own `401 Bad credentials`

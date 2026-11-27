@@ -437,6 +437,7 @@ class SummaryAcrossRoundsTest {
             delta,
             List.of(),
             finding -> "",
+            false,
             inlineComments));
     var captor = ArgumentCaptor.forClass(GitHubReviewClient.CreateReviewRequest.class);
     verify(reviewClient, atLeastOnce())
