@@ -1715,9 +1715,9 @@ class ReviewOrchestratorTest {
           new ReviewResult(
               List.of(), 0, 0, 0, 0, null, ReviewState.APPROVE, true, "", List.of(), List.of(), 0);
 
-      String title = VerdictBuilder.checkTitleForResult(result);
+      String title = VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED);
 
-      assertEquals("ThrillhouseBot Review ✅", title);
+      assertEquals("Approved ✅", title);
     }
 
     @Test
@@ -1726,7 +1726,8 @@ class ReviewOrchestratorTest {
           new ReviewResult(
               List.of(), 0, 0, 0, 0, null, ReviewState.COMMENT, true, "", List.of(), List.of(), 3);
 
-      assertFalse(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertFalse(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
     }
 
     @Test
@@ -1745,7 +1746,8 @@ class ReviewOrchestratorTest {
       assertEquals(ReviewState.COMMENT, result.reviewState());
       assertTrue(result.ciUnreadable());
       assertTrue(result.offendingCiChecks().isEmpty());
-      assertFalse(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertFalse(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       assertEquals("neutral", VerdictBuilder.conclusionForResult(result));
       assertTrue(
           VerdictBuilder.checkSummaryForResult(result).contains("CI status could not be read"));
@@ -1758,7 +1760,8 @@ class ReviewOrchestratorTest {
           new ReviewResult(
               List.of(), 0, 0, 0, 0, null, ReviewState.COMMENT, true, "", List.of(), offending, 0);
 
-      assertFalse(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertFalse(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       String summary = VerdictBuilder.checkSummaryForResult(result);
       assertFalse(summary.contains("Everything's coming up Thrillhouse"));
       assertTrue(summary.contains("required CI check(s) are still pending or failing"));
@@ -7448,7 +7451,8 @@ class ReviewOrchestratorTest {
               List.of());
 
       assertEquals(ReviewState.COMMENT, result.reviewState());
-      assertFalse(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertFalse(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       assertTrue(
           VerdictBuilder.checkSummaryForResult(result)
               .contains("1 previous finding(s) remain unresolved"));
@@ -7513,7 +7517,8 @@ class ReviewOrchestratorTest {
               List.of());
 
       assertEquals(ReviewState.APPROVE, result.reviewState());
-      assertTrue(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertTrue(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       assertTrue(VerdictBuilder.checkSummaryForResult(result).contains("No issues found"));
     }
 
@@ -7940,7 +7945,8 @@ class ReviewOrchestratorTest {
               List.of(new ReviewResult.PreviousFindingStatus(1, "unresolved", "still present")));
 
       assertEquals(ReviewState.COMMENT, result.reviewState());
-      assertFalse(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertFalse(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       assertTrue(
           VerdictBuilder.checkSummaryForResult(result)
               .contains("1 previous finding(s) remain unresolved"));
@@ -7953,7 +7959,8 @@ class ReviewOrchestratorTest {
       var result = buildWithBackstop(List.of());
 
       assertEquals(ReviewState.APPROVE, result.reviewState());
-      assertTrue(VerdictBuilder.checkTitleForResult(result).contains("✅"));
+      assertTrue(
+          VerdictBuilder.checkTitleForResult(result, BlockingStrictness.BALANCED).contains("✅"));
       assertTrue(VerdictBuilder.checkSummaryForResult(result).contains("No issues found"));
     }
 
