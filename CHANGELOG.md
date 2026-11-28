@@ -150,6 +150,11 @@ cannot resolve its review threads.
 
 ### Fixed
 
+- **A finding cleared from the PR conversation is not raised again on an unchanged file**
+  (#1430): a later round could report the same defect in other words and count it as new,
+  because only a finding answered on its own review thread was dropped. A finding closed with
+  `@thrillhousebot resolved` on the conversation is now dropped too while its file is unchanged
+  since the round that raised it. A changed file still raises it.
 - **A review no longer drifts into another language** (#1467): no prompt said which language to
   write in, so a model could answer an English pull request with a summary in another one. Every
   prompt now asks for English prose, with code, identifiers, paths and quotations left as they are.

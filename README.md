@@ -938,6 +938,11 @@ One comment may name several findings; each is matched on its own. A finding
 with neither title nor description cannot be named, so fix it or reply on its
 thread if it has one. The next review records a named finding resolved.
 
+While the finding's file is unchanged since the round that raised it, a later
+review does not raise the same defect again, even worded differently. After a
+change to that file, or when the bot cannot tell whether it changed (a force
+push, for example), the finding can be raised again.
+
 The bot's reply says which open findings on record the comment matched, and for
 a `path:line` named with a different title it shows the title on record. A title
 also matches as the summary comment's source holds it (`&#96;` for a backtick,

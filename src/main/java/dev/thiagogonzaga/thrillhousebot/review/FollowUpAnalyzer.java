@@ -858,6 +858,73 @@ public class FollowUpAnalyzer {
   }
 
   /**
+   * Drops a finding that is the same defect as an earlier one a maintainer closed with the resolved
+   * directive on the PR conversation, while the earlier finding's file is unchanged since the round
+   * that raised it (#1430). A finding with no thread can only be closed there, so {@link
+   * #dropRepliedDuplicates} never sees it. A changed file, or one whose change cannot be told,
+   * leaves the finding raised: a change can bring the defect back. The "left by the fix" exception
+   * (#1388) has no counterpart here, because no fix has touched a file that is unchanged.
+   *
+   * @param priorRounds every completed prior round's parsed response, newest first, the order
+   *     {@link DiffLineResolver#fileChangeSince} reads
+   */
+  public static ReviewResponse withoutConversationCleared(
+      ReviewResponse response,
+      List<ReviewResponse> priorRounds,
+      List<GitHubCommentClient.IssueComment> conversationComments,
+      DiffLineResolver lineResolver,
+      BotIdentity botIdentity,
+      VerifiedWriters writers) {
+    if (response.findings().isEmpty() || conversationComments.isEmpty()) {
+      return response;
+    }
+    var kept = new ArrayList<ReviewResponse.Finding>();
+    for (var finding : response.findings()) {
+      var cleared =
+          findClearedDuplicate(
+              finding, priorRounds, conversationComments, lineResolver, botIdentity, writers);
+      if (cleared == null) {
+        kept.add(finding);
+        continue;
+      }
+      Log.infof(
+          "Dropping re-raised finding '%s' (%s:%d); a maintainer already cleared the prior finding"
+              + " '%s' from the PR conversation and its file is unchanged since",
+          LogSafe.oneLine(finding.title()),
+          LogSafe.oneLine(finding.file()),
+          finding.line(),
+          LogSafe.oneLine(cleared.title()));
+    }
+    if (kept.size() == response.findings().size()) {
+      return response;
+    }
+    return new ReviewResponse(
+        kept,
+        response.previousFindingsStatus(),
+        FindingVerificationService.recount(response.summary(), kept));
+  }
+
+  private static ReviewResponse.Finding findClearedDuplicate(
+      ReviewResponse.Finding finding,
+      List<ReviewResponse> priorRounds,
+      List<GitHubCommentClient.IssueComment> conversationComments,
+      DiffLineResolver lineResolver,
+      BotIdentity botIdentity,
+      VerifiedWriters writers) {
+    for (var round = 0; round < priorRounds.size(); round++) {
+      for (var prior : priorRounds.get(round).findings()) {
+        // The file comparison comes last: it is the one check that can call GitHub.
+        if (isSameFinding(finding, prior)
+            && namedByClearDirective(prior, conversationComments, botIdentity, writers)
+            && unchangedSince(round, prior, lineResolver)) {
+          return prior;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * The keys of the prior findings {@code statuses} mark resolved. The statuses reaching here were
    * screened ({@link ModelStatusScreen}): each echoes the key of the finding it names, so the key
    * names the finding whatever round raised it.
@@ -1577,6 +1644,25 @@ public class FollowUpAnalyzer {
       List<GitHubCommentClient.IssueComment> conversationComments,
       BotIdentity botIdentity,
       VerifiedWriters writers) {
+    if (!namedByClearDirective(finding, conversationComments, botIdentity, writers)) {
+      return false;
+    }
+    Log.infof(
+        "Clearing previous finding '%s' (%s) — a maintainer named it in an"
+            + " @thrillhousebot resolved comment on the PR conversation",
+        LogSafe.oneLine(finding.title()),
+        // The locator is composed from the finding's own file, so it is model-supplied in the
+        // same way the title is; the matching reads the unsanitized value (#764).
+        LogSafe.oneLine(finding.file() + ":" + finding.line()));
+    return true;
+  }
+
+  /** Whether a maintainer's resolved directive on the PR conversation names {@code finding}. */
+  private static boolean namedByClearDirective(
+      ReviewResponse.Finding finding,
+      List<GitHubCommentClient.IssueComment> conversationComments,
+      BotIdentity botIdentity,
+      VerifiedWriters writers) {
     if (conversationComments == null || conversationComments.isEmpty() || finding.file() == null) {
       return false;
     }
@@ -1585,25 +1671,14 @@ public class FollowUpAnalyzer {
       return false;
     }
     String locator = finding.file() + ":" + finding.line();
-    for (var comment : conversationComments) {
-      if (!isMaintainerConversationComment(comment, botIdentity, writers)
-          || !isClearDirective(comment.body(), botIdentity)) {
-        continue;
-      }
-      // The naming may sit in backticks (the shape the summary prints); only the directive token
-      // may not — see isClearDirective.
-      if (namesFinding(namingText(comment.body()), locator, anchor)) {
-        Log.infof(
-            "Clearing previous finding '%s' (%s) — a maintainer named it in an"
-                + " @thrillhousebot resolved comment on the PR conversation",
-            LogSafe.oneLine(finding.title()),
-            // The locator is composed from the finding's own file, so it is model-supplied in the
-            // same way the title is; the matching above reads the unsanitized value (#764).
-            LogSafe.oneLine(locator));
-        return true;
-      }
-    }
-    return false;
+    // The naming may sit in backticks (the shape the summary prints); only the directive token
+    // may not — see isClearDirective.
+    return conversationComments.stream()
+        .anyMatch(
+            comment ->
+                isMaintainerConversationComment(comment, botIdentity, writers)
+                    && isClearDirective(comment.body(), botIdentity)
+                    && namesFinding(namingText(comment.body()), locator, anchor));
   }
 
   /**
