@@ -2395,13 +2395,16 @@ public class ReviewPublisher {
    *
    * <p>An earlier round's finding whose code left the diff ({@code superseded} with the root of its
    * own thread) is resolved too (#1066). Resolving is idempotent: a resolved thread is skipped.
+   *
+   * @return the visible root comments of addressed threads GitHub would not resolve (#1441)
    */
-  void resolveAddressedThreads(
+  List<String> resolveAddressedThreads(
       String auth,
       ReviewOrchestrator.ReviewRequest req,
       List<ReviewResponse.Finding> previousFindings,
       List<GitHubReviewClient.PullRequestComment> inlineComments,
       List<ReviewResult.PreviousFindingStatus> statuses) {
+    var refused = new ArrayList<String>();
     try {
       logEarlierRoundStatuses(req, statuses);
       List<ReviewResult.PreviousFindingStatus> addressed =
@@ -2413,7 +2416,7 @@ public class ReviewPublisher {
                           || s.closesEarlierRound())
               .toList();
       if (addressed.isEmpty() || inlineComments.isEmpty()) {
-        return;
+        return refused;
       }
       var rootByFinding =
           followUpAnalyzer.matchFindingThreads(previousFindings, inlineComments, botIdentity);
@@ -2430,7 +2433,7 @@ public class ReviewPublisher {
         if (clearedByDirective(status)) {
           replyOnClearedThread(auth, req, rootCommentId);
         }
-        if (resolveUnlessRefused(auth, req, thread.id())) {
+        if (resolveUnlessRefused(auth, req, thread, refused)) {
           resolved++;
         }
       }
@@ -2442,14 +2445,22 @@ public class ReviewPublisher {
     } catch (RuntimeException e) {
       Log.warn("Failed to resolve addressed review threads (continuing)", e);
     }
+    return refused;
   }
 
   /** Resolves one thread; a refusal is logged with GitHub's reason and costs only that thread. */
   private boolean resolveUnlessRefused(
-      String auth, ReviewOrchestrator.ReviewRequest req, String threadId) {
+      String auth,
+      ReviewOrchestrator.ReviewRequest req,
+      ReviewThreadService.ThreadRef thread,
+      List<String> refused) {
+    var threadId = thread.id();
     try {
       return reviewThreadService.resolve(auth, threadId);
     } catch (GitHubGraphQLException e) {
+      if (thread.visibleRootId() != null) {
+        refused.add(thread.visibleRootId());
+      }
       Log.warnf(
           "GitHub refused to resolve review thread %s on %s/%s #%d: %s%s",
           threadId,
